@@ -1581,3 +1581,442 @@ def test_list_rate_locks_unknown_contract_404(client):
     r = get_locks(client, "GHOST")
     assert r.status_code == 404
     assert r.json()["detail"]["code"] == "CONTRACT_NOT_FOUND"
+
+
+# ---------- 费率修订预演与条件提交 ----------
+
+def post_revision_preview(client, contract, **kw):
+    return client.post(f"/contracts/{contract}/rate-revision-previews", json=kw)
+
+
+def test_revision_preview_basic_shape_and_no_writes(client):
+    """无重叠新区间的预演：主版本取下一版本号、无取代/补偿；预演全程不写库。"""
+    post_rate(client, contract_no="RP-1", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z", reason="上半年")
+    r = post_revision_preview(client, "RP-1", rate=0.06,
+                              valid_from="2026-06-01T00:00:00Z",
+                              valid_to="2027-01-01T00:00:00Z",
+                              recorded_at="2026-02-01T00:00:00Z", reason="下半年")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["contract_no"] == "RP-1"
+    assert body["ready"] is True
+    assert body["blocking"] is None
+    assert body["state_token"]
+    assert body["created"] == {
+        "contract_no": "RP-1", "rate": 0.06, "version": 2,
+        "valid_from": "2026-06-01T00:00:00.000000+00:00",
+        "valid_to": "2027-01-01T00:00:00.000000+00:00",
+        "recorded_at": "2026-02-01T00:00:00.000000+00:00",
+        "reason": "下半年",
+    }
+    assert body["superseded_versions"] == []
+    assert body["retained_versions"] == []
+
+    # 预演全程不写库：时间线仍只有 v1，报价不受影响
+    versions = client.get("/contracts/RP-1/timeline").json()["versions"]
+    assert [v["version"] for v in versions] == [1]
+    assert _quote(client, "RP-1", "2026-07-01T00:00:00Z",
+                  "2026-02-02T00:00:00Z").status_code == 404
+
+    # 携带 token 条件提交：结果与预演完全一致
+    commit = post_rate(client, contract_no="RP-1", rate=0.06,
+                       valid_from="2026-06-01T00:00:00Z",
+                       valid_to="2027-01-01T00:00:00Z",
+                       recorded_at="2026-02-01T00:00:00Z", reason="下半年",
+                       state_token=body["state_token"])
+    assert commit.status_code == 201, commit.text
+    cbody = commit.json()
+    assert cbody["created"]["version"] == 2
+    assert cbody["created"]["rate"] == 0.06
+    assert cbody["created"]["recorded_at"] == "2026-02-01T00:00:00.000000+00:00"
+    assert cbody["superseded_rate_ids"] == []
+    assert cbody["retained_versions"] == []
+
+
+def test_revision_preview_partial_overlap_matches_commit(client):
+    """部分重叠：预演给出主版本、被取代版本与左右补偿片段；token 提交逐项一致。"""
+    post_rate(client, contract_no="RP-2", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z", reason="原费率")
+    body = post_revision_preview(client, "RP-2", rate=0.09,
+                                 valid_from="2026-04-01T00:00:00Z",
+                                 valid_to="2026-07-01T00:00:00Z",
+                                 recorded_at="2026-03-01T00:00:00Z",
+                                 reason="年中调整").json()
+    assert body["ready"] is True
+    assert body["created"]["version"] == 2
+    assert body["created"]["rate"] == 0.09
+    # 被取代版本为完整版本视图（当前仍 current）
+    (sup,) = body["superseded_versions"]
+    assert sup["rate_id"] == 1
+    assert sup["version"] == 1
+    assert sup["status"] == "current"
+    assert sup["rate"] == 0.05
+    # 补偿片段：左右两段，原费率原 reason，预计版本号 3、4
+    assert [(v["version"], v["valid_from"], v["valid_to"], v["rate"], v["reason"])
+            for v in body["retained_versions"]] == [
+        (3, "2026-01-01T00:00:00.000000+00:00", "2026-04-01T00:00:00.000000+00:00",
+         0.05, "原费率"),
+        (4, "2026-07-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00",
+         0.05, "原费率"),
+    ]
+    assert all(v["recorded_at"] == "2026-03-01T00:00:00.000000+00:00"
+               for v in body["retained_versions"])
+
+    # 预演不写库：v1 仍是 current
+    versions = client.get("/contracts/RP-2/timeline").json()["versions"]
+    assert [v["version"] for v in versions] == [1]
+    assert versions[0]["status"] == "current"
+
+    commit = post_rate(client, contract_no="RP-2", rate=0.09,
+                       valid_from="2026-04-01T00:00:00Z",
+                       valid_to="2026-07-01T00:00:00Z",
+                       recorded_at="2026-03-01T00:00:00Z", reason="年中调整",
+                       state_token=body["state_token"])
+    assert commit.status_code == 201, commit.text
+    cbody = commit.json()
+    assert cbody["created"]["version"] == body["created"]["version"]
+    assert cbody["superseded_rate_ids"] == [1]
+    assert [(v["version"], v["valid_from"], v["valid_to"], v["rate"], v["reason"])
+            for v in cbody["retained_versions"]] == [
+        (v["version"], v["valid_from"], v["valid_to"], v["rate"], v["reason"])
+        for v in body["retained_versions"]
+    ]
+
+
+def test_revision_preview_open_ended_consistency(client):
+    """开放上界拟议区间：预演只给左补偿，提交结果一致。"""
+    post_rate(client, contract_no="RP-3", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="RP-3", rate=0.06,
+              valid_from="2026-06-01T00:00:00Z", valid_to="2026-10-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    body = post_revision_preview(client, "RP-3", rate=0.09,
+                                 valid_from="2026-03-01T00:00:00Z",
+                                 recorded_at="2026-04-01T00:00:00Z").json()
+    assert body["created"]["version"] == 3
+    assert body["created"]["valid_to"] is None
+    assert [v["rate_id"] for v in body["superseded_versions"]] == [1, 2]
+    (left,) = body["retained_versions"]
+    assert (left["version"], left["valid_from"], left["valid_to"], left["rate"]) == (
+        4, "2026-01-01T00:00:00.000000+00:00", "2026-03-01T00:00:00.000000+00:00", 0.05)
+
+    commit = post_rate(client, contract_no="RP-3", rate=0.09,
+                       valid_from="2026-03-01T00:00:00Z",
+                       recorded_at="2026-04-01T00:00:00Z",
+                       state_token=body["state_token"])
+    assert commit.status_code == 201, commit.text
+    cbody = commit.json()
+    assert cbody["created"]["version"] == 3
+    assert cbody["created"]["valid_to"] is None
+    assert cbody["superseded_rate_ids"] == [1, 2]
+    (cleft,) = cbody["retained_versions"]
+    assert (cleft["version"], cleft["valid_from"], cleft["valid_to"], cleft["rate"]) == (
+        4, "2026-01-01T00:00:00.000000+00:00", "2026-03-01T00:00:00.000000+00:00", 0.05)
+
+
+def test_revision_preview_spanning_multiple_old_versions(client):
+    """修订区间跨越两条相接旧版本：预演与提交的取代集合、左右补偿完全一致。"""
+    post_rate(client, contract_no="RP-4", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z", reason="上半年")
+    post_rate(client, contract_no="RP-4", rate=0.06,
+              valid_from="2026-06-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z", reason="下半年")
+    body = post_revision_preview(client, "RP-4", rate=0.09,
+                                 valid_from="2026-04-01T00:00:00Z",
+                                 valid_to="2026-08-01T00:00:00Z",
+                                 recorded_at="2026-03-01T00:00:00Z").json()
+    assert body["created"]["version"] == 3
+    assert [v["rate_id"] for v in body["superseded_versions"]] == [1, 2]
+    assert [(v["version"], v["valid_from"], v["valid_to"], v["rate"], v["reason"])
+            for v in body["retained_versions"]] == [
+        (4, "2026-01-01T00:00:00.000000+00:00", "2026-04-01T00:00:00.000000+00:00",
+         0.05, "上半年"),
+        (5, "2026-08-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00",
+         0.06, "下半年"),
+    ]
+    commit = post_rate(client, contract_no="RP-4", rate=0.09,
+                       valid_from="2026-04-01T00:00:00Z",
+                       valid_to="2026-08-01T00:00:00Z",
+                       recorded_at="2026-03-01T00:00:00Z",
+                       state_token=body["state_token"])
+    assert commit.status_code == 201, commit.text
+    cbody = commit.json()
+    assert cbody["created"]["version"] == 3
+    assert cbody["superseded_rate_ids"] == [1, 2]
+    assert [(v["version"], v["valid_from"], v["valid_to"], v["rate"], v["reason"])
+            for v in cbody["retained_versions"]] == [
+        (4, "2026-01-01T00:00:00.000000+00:00", "2026-04-01T00:00:00.000000+00:00",
+         0.05, "上半年"),
+        (5, "2026-08-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00",
+         0.06, "下半年"),
+    ]
+
+
+def test_revision_preview_adjacent_touch_only(client):
+    """仅端点相接（不相交）：预演无取代无补偿，提交结果一致。"""
+    post_rate(client, contract_no="RP-5", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    body = post_revision_preview(client, "RP-5", rate=0.08,
+                                 valid_from="2026-06-01T00:00:00Z",
+                                 valid_to="2026-09-01T00:00:00Z",
+                                 recorded_at="2026-02-01T00:00:00Z").json()
+    assert body["ready"] is True
+    assert body["superseded_versions"] == []
+    assert body["retained_versions"] == []
+    commit = post_rate(client, contract_no="RP-5", rate=0.08,
+                       valid_from="2026-06-01T00:00:00Z",
+                       valid_to="2026-09-01T00:00:00Z",
+                       recorded_at="2026-02-01T00:00:00Z",
+                       state_token=body["state_token"])
+    assert commit.status_code == 201, commit.text
+    assert commit.json()["superseded_rate_ids"] == []
+    assert commit.json()["retained_versions"] == []
+
+
+def test_revision_preview_unknown_contract_ready(client):
+    """合同不存在也可预演：无取代/补偿，主版本为 v1。"""
+    body = post_revision_preview(client, "GHOST", rate=0.05,
+                                 valid_from="2026-01-01T00:00:00Z",
+                                 recorded_at="2026-01-01T00:00:00Z").json()
+    assert body["ready"] is True
+    assert body["created"]["version"] == 1
+    assert body["superseded_versions"] == []
+    assert body["retained_versions"] == []
+    assert body["state_token"]
+
+
+def test_revision_preview_invalid_interval_422(client):
+    r = post_revision_preview(client, "RP-6", rate=0.05,
+                              valid_from="2026-06-01T00:00:00Z",
+                              valid_to="2026-01-01T00:00:00Z")
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "INVALID_INTERVAL"
+
+
+def test_revision_preview_malformed_request_422(client):
+    r = post_revision_preview(client, "RP-6", valid_from="2026-01-01T00:00:00Z")
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+    r = post_revision_preview(client, "RP-6", rate=0.05, valid_from="not-a-date")
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+
+
+def test_revision_preview_blocked_by_lock(client):
+    """拟议区间与锁相交：预演 ready=false、阻断原因 RATE_WINDOW_LOCKED，不发令牌、不写库。"""
+    _seed_split_year(client, "RP-7")
+    _lock_q2(client, "RP-7")
+    r = post_revision_preview(client, "RP-7", rate=0.2,
+                              valid_from="2026-05-01T00:00:00Z",
+                              valid_to="2026-06-01T00:00:00Z",
+                              recorded_at="2026-08-01T00:00:00Z")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ready"] is False
+    assert body["state_token"] is None
+    assert body["created"] is None
+    assert body["superseded_versions"] == []
+    assert body["retained_versions"] == []
+    blocking = body["blocking"]
+    assert blocking["code"] == "RATE_WINDOW_LOCKED"
+    (lock,) = blocking["locks"]
+    assert lock["basis_rate_id"] == 2
+    assert lock["reason"] == "Q2锁定"
+    assert blocking["intersections"] == [{
+        "from": "2026-05-01T00:00:00.000000+00:00",
+        "to": "2026-06-01T00:00:00.000000+00:00",
+    }]
+    # 预演不写库：时间线仍是 v1..v4
+    versions = client.get("/contracts/RP-7/timeline").json()["versions"]
+    assert [v["version"] for v in versions] == [1, 2, 3, 4]
+
+
+def test_revision_preview_lock_priority_over_monotonic(client):
+    """锁相交与 recorded_at 单调性同时违反时，阻断原因优先报告锁。"""
+    _seed_split_year(client, "RP-8")
+    _lock_q2(client, "RP-8")
+    body = post_revision_preview(client, "RP-8", rate=0.2,
+                                 valid_from="2026-05-01T00:00:00Z",
+                                 valid_to="2026-06-01T00:00:00Z",
+                                 recorded_at="2026-01-02T00:00:00Z").json()
+    assert body["ready"] is False
+    assert body["blocking"]["code"] == "RATE_WINDOW_LOCKED"
+
+
+def test_revision_preview_non_monotonic_blocked(client):
+    """recorded_at 早于已有记录：预演 ready=false、阻断原因 NON_MONOTONIC_RECORDED_AT。"""
+    post_rate(client, contract_no="RP-9", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z",
+              recorded_at="2026-06-01T00:00:00Z")
+    body = post_revision_preview(client, "RP-9", rate=0.06,
+                                 valid_from="2026-01-01T00:00:00Z",
+                                 recorded_at="2026-05-01T00:00:00Z").json()
+    assert body["ready"] is False
+    assert body["state_token"] is None
+    assert body["created"] is None
+    assert body["blocking"]["code"] == "NON_MONOTONIC_RECORDED_AT"
+    assert body["blocking"]["locks"] == []
+    assert body["blocking"]["intersections"] == []
+
+
+def test_revision_preview_touching_lock_boundary_ready(client):
+    """仅与锁端点相接的拟议区间：预演 ready，token 提交成功且结果一致。"""
+    _seed_split_year(client, "RP-10")
+    _lock_q2(client, "RP-10")
+    body = post_revision_preview(client, "RP-10", rate=0.11,
+                                 valid_from="2026-07-01T00:00:00Z",
+                                 valid_to="2026-08-01T00:00:00Z",
+                                 recorded_at="2026-08-01T00:00:00Z").json()
+    assert body["ready"] is True
+    assert body["created"]["version"] == 5
+    assert [v["rate_id"] for v in body["superseded_versions"]] == [4]
+    (right,) = body["retained_versions"]
+    assert (right["version"], right["valid_from"], right["valid_to"], right["rate"]) == (
+        6, "2026-08-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00", 0.05)
+    commit = post_rate(client, contract_no="RP-10", rate=0.11,
+                       valid_from="2026-07-01T00:00:00Z",
+                       valid_to="2026-08-01T00:00:00Z",
+                       recorded_at="2026-08-01T00:00:00Z",
+                       state_token=body["state_token"])
+    assert commit.status_code == 201, commit.text
+    cbody = commit.json()
+    assert cbody["created"]["version"] == 5
+    assert cbody["superseded_rate_ids"] == [4]
+    assert [(v["version"], v["valid_from"], v["valid_to"], v["rate"])
+            for v in cbody["retained_versions"]] == [
+        (6, "2026-08-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00", 0.05)]
+
+
+# ---------- 条件提交：state_token 失效与校验 ----------
+
+def test_stale_token_after_intervening_revision(client):
+    """预演后合同发生其他修订：token 失效，409 STALE_REVISION_PREVIEW 且不写库。"""
+    post_rate(client, contract_no="RP-11", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    body = post_revision_preview(client, "RP-11", rate=0.09,
+                                 valid_from="2026-04-01T00:00:00Z",
+                                 valid_to="2026-07-01T00:00:00Z",
+                                 recorded_at="2026-03-01T00:00:00Z").json()
+    token = body["state_token"]
+    # 另一客户端先提交了一个不相交区间的修订（版本号水位随之变化）
+    post_rate(client, contract_no="RP-11", rate=0.07,
+              valid_from="2027-06-01T00:00:00Z", valid_to="2027-09-01T00:00:00Z",
+              recorded_at="2026-03-01T00:00:00Z")
+    r = post_rate(client, contract_no="RP-11", rate=0.09,
+                  valid_from="2026-04-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+                  recorded_at="2026-03-01T00:00:00Z", state_token=token)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "STALE_REVISION_PREVIEW"
+    # 不产生任何写入：只有 v1 与插入的 v2
+    versions = client.get("/contracts/RP-11/timeline").json()["versions"]
+    assert [v["version"] for v in versions] == [1, 2]
+
+
+def test_stale_token_after_new_lock(client):
+    """预演后新增锁（即使与拟议区间不相交）：锁集合变化 → 409 STALE_REVISION_PREVIEW。"""
+    _seed_split_year(client, "RP-12")
+    body = post_revision_preview(client, "RP-12", rate=0.11,
+                                 valid_from="2026-07-01T00:00:00Z",
+                                 valid_to="2026-08-01T00:00:00Z",
+                                 recorded_at="2026-08-01T00:00:00Z").json()
+    assert body["ready"] is True
+    _lock_q2(client, "RP-12")
+    r = post_rate(client, contract_no="RP-12", rate=0.11,
+                  valid_from="2026-07-01T00:00:00Z", valid_to="2026-08-01T00:00:00Z",
+                  recorded_at="2026-08-01T00:00:00Z", state_token=body["state_token"])
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "STALE_REVISION_PREVIEW"
+    versions = client.get("/contracts/RP-12/timeline").json()["versions"]
+    assert [v["version"] for v in versions] == [1, 2, 3, 4]
+
+
+def test_token_single_use_after_successful_commit(client):
+    """提交成功后合同状态已变，同一 token 再次提交 → 409 STALE_REVISION_PREVIEW。"""
+    post_rate(client, contract_no="RP-13", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    body = post_revision_preview(client, "RP-13", rate=0.09,
+                                 valid_from="2026-04-01T00:00:00Z",
+                                 valid_to="2026-07-01T00:00:00Z",
+                                 recorded_at="2026-03-01T00:00:00Z").json()
+    kw = dict(contract_no="RP-13", rate=0.09,
+              valid_from="2026-04-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-03-01T00:00:00Z", state_token=body["state_token"])
+    assert post_rate(client, **kw).status_code == 201
+    r = post_rate(client, **kw)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "STALE_REVISION_PREVIEW"
+
+
+def test_token_param_mismatch_422(client):
+    """token 绑定参数与本次录入不一致 → 422 INVALID_STATE_TOKEN，不写库。"""
+    post_rate(client, contract_no="RP-14", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    body = post_revision_preview(client, "RP-14", rate=0.09,
+                                 valid_from="2026-04-01T00:00:00Z",
+                                 valid_to="2026-07-01T00:00:00Z",
+                                 recorded_at="2026-03-01T00:00:00Z").json()
+    token = body["state_token"]
+    # 费率不同
+    r = post_rate(client, contract_no="RP-14", rate=0.10,
+                  valid_from="2026-04-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+                  recorded_at="2026-03-01T00:00:00Z", state_token=token)
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "INVALID_STATE_TOKEN"
+    # 合同号不同
+    r = post_rate(client, contract_no="RP-OTHER", rate=0.09,
+                  valid_from="2026-04-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+                  recorded_at="2026-03-01T00:00:00Z", state_token=token)
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "INVALID_STATE_TOKEN"
+    # recorded_at 不同
+    r = post_rate(client, contract_no="RP-14", rate=0.09,
+                  valid_from="2026-04-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+                  recorded_at="2026-03-02T00:00:00Z", state_token=token)
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "INVALID_STATE_TOKEN"
+    # 均未写库
+    versions = client.get("/contracts/RP-14/timeline").json()["versions"]
+    assert [v["version"] for v in versions] == [1]
+
+
+def test_invalid_state_token_422(client):
+    """格式非法或签名被篡改的 token → 422 INVALID_STATE_TOKEN。"""
+    r = post_rate(client, contract_no="RP-15", rate=0.05,
+                  valid_from="2026-01-01T00:00:00Z",
+                  recorded_at="2026-01-01T00:00:00Z",
+                  state_token="not-a-valid-token")
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "INVALID_STATE_TOKEN"
+    # 篡改签名
+    body = post_revision_preview(client, "RP-15", rate=0.06,
+                                 valid_from="2026-01-01T00:00:00Z",
+                                 recorded_at="2026-02-01T00:00:00Z").json()
+    raw, _sig = body["state_token"].rsplit(".", 1)
+    r = post_rate(client, contract_no="RP-15", rate=0.06,
+                  valid_from="2026-01-01T00:00:00Z",
+                  recorded_at="2026-02-01T00:00:00Z",
+                  state_token=raw + "." + "0" * 64)
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "INVALID_STATE_TOKEN"
+
+
+def test_token_commit_uses_preview_recorded_at_when_omitted(client):
+    """预演与提交均缺省 recorded_at：提交落库的记录时间与预演一致。"""
+    body = post_revision_preview(client, "RP-16", rate=0.05,
+                                 valid_from="2026-01-01T00:00:00Z").json()
+    assert body["ready"] is True
+    preview_ra = body["created"]["recorded_at"]
+    r = post_rate(client, contract_no="RP-16", rate=0.05,
+                  valid_from="2026-01-01T00:00:00Z",
+                  state_token=body["state_token"])
+    assert r.status_code == 201, r.text
+    assert r.json()["created"]["recorded_at"] == preview_ra

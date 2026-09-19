@@ -21,6 +21,7 @@ docker compose up --build
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `DATABASE_PATH` | 容器内 `/data/rates.db`（本地直跑默认 `./rates.db`） | SQLite 数据库文件路径，启动时自动建表 |
+| `STATE_TOKEN_SECRET` | 内置开发值 | 修订预演 `state_token` 的 HMAC 签名密钥，生产环境应覆盖 |
 | `ports` | `8000:8000` | 在 `docker-compose.yml` 中修改宿主机端口 |
 
 数据通过 Compose 命名卷 `rates-data` 持久化，删除容器不丢数据。
@@ -70,6 +71,15 @@ docker compose up --build
 **不新增版本、不产生补偿片段、不写血缘边**——锁外区间的正常修订不受影响。
 锁记录不因后续修订而改变，可在审计时与当前费率对照。
 
+**修订预演与条件提交（v1.6 起）**：`POST /contracts/{contract_no}/rate-revision-previews`
+与 `POST /rates` 共用**同一规划逻辑**（锁相交优先 → `recorded_at` 单调性 → 部分重叠
+补偿 → 版本号递增），但**全程只读、不写库**：返回将创建的主版本（含预计版本号）、
+被取代版本、补偿片段；若会被锁或单调性阻断，则返回阻断原因（`ready=false`、不签发
+令牌）。预演通过时签发 `state_token`（HMAC 签名的无状态令牌，绑定本次全部参数与
+合同状态指纹）；`POST /rates` 携带该 token 时为**条件提交**：仅当合同的当前版本
+集合与锁集合自预演以来未变化才真正落库，否则 `409 STALE_REVISION_PREVIEW`、
+不写任何数据。令牌事实上一次性：成功提交后合同状态即变，同一 token 再用即失效。
+
 ## 接口
 
 ### 1. 录入 / 修订费率 — `POST /rates`
@@ -99,6 +109,11 @@ curl -X POST http://localhost:8000/rates \
   （见第 8 节）：`detail.locks` 列出相交锁、`detail.intersections` 按同序列出
   各自交集 `{from, to}`；此时**不新增版本、不产生补偿片段、不写血缘边**。
   区间左闭右开，仅端点相接不算相交，锁外修订照常进行。
+- 可携带修订预演签发的 `state_token` 进行**条件提交**（见第 10 节）：token 绑定的
+  `contract_no` / `rate` / 区间 / `reason` 必须与本次请求一致（`recorded_at` 缺省时
+  以 token 绑定的预演时间为准），且合同的当前版本集合与锁集合自预演以来未变化；
+  否则分别返回 `422 INVALID_STATE_TOKEN` / `409 STALE_REVISION_PREVIEW`，
+  均**不产生任何写入**。
 
 部分重叠修订的响应示例（原费率 0.05 覆盖全年，新费率 0.09 只替换 4–6 月）：
 
@@ -457,6 +472,105 @@ curl http://localhost:8000/contracts/HT-2026-001/rate-locks
 多次锁定产生的片段一并返回。合同有费率版本但尚无锁时返回空数组；
 合同不存在（无任何费率版本）返回 `404 CONTRACT_NOT_FOUND`。
 
+### 10. 费率修订预演 — `POST /contracts/{contract_no}/rate-revision-previews`
+
+```bash
+# 预演：请求体与录入接口一致（contract_no 由路径给出），全程不写库
+curl -X POST http://localhost:8000/contracts/HT-2026-001/rate-revision-previews \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "rate": 0.09,
+        "valid_from": "2026-04-01T00:00:00Z",
+        "valid_to":   "2026-07-01T00:00:00Z",
+        "recorded_at": "2026-03-01T00:00:00Z",
+        "reason": "年中调整"
+      }'
+
+# 条件提交：携带预演签发的 state_token，相关状态未变才落库
+curl -X POST http://localhost:8000/rates \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "contract_no": "HT-2026-001",
+        "rate": 0.09,
+        "valid_from": "2026-04-01T00:00:00Z",
+        "valid_to":   "2026-07-01T00:00:00Z",
+        "recorded_at": "2026-03-01T00:00:00Z",
+        "reason": "年中调整",
+        "state_token": "<预演响应中的 state_token>"
+      }'
+```
+
+- 请求体字段与 `POST /rates` 一致：`rate`、`valid_from` 必填，`valid_to` /
+  `recorded_at` / `reason` 可选（`recorded_at` 缺省为当前时间）。
+- 预演与正式提交**共用同一规划逻辑**：开放上界、多旧版本重叠、仅端点相接等
+  情形下，将创建的主版本、被取代版本与补偿片段**完全一致**；预演**全程不写库**。
+- `ready=true`：`created` 为将创建的主版本（含预计 `version`，尚无 `rate_id`），
+  `superseded_versions` 为将被取代的当前版本（完整版本视图），
+  `retained_versions` 为将追加的补偿片段（原费率、原 `reason`，版本号紧随主版本，
+  按 `valid_from` 排序），并签发 `state_token`。
+- `ready=false`：`blocking` 给出阻断原因（锁相交优先于 `recorded_at` 单调性），
+  不签发令牌；`created` / `state_token` 为 `null`，两个版本列表为空。
+- `state_token` 绑定本次全部参数与合同状态指纹（当前版本集合、版本号/记录时间
+  水位、锁集合）；`POST /rates` 携带时仅当这些相关状态未变化才提交，令牌事实上
+  一次性（成功提交后即失效）。
+
+| 情形 | 状态码 | `code` |
+|---|---|---|
+| 预演完成（`ready` 为 true/false 均可能） | 200 | — |
+| `valid_to <= valid_from` | 422 | `INVALID_INTERVAL` |
+| 缺必填字段 / 时间格式非法 | 422 | `INVALID_REQUEST` |
+| 提交时 token 非法、被篡改或与本次参数不一致 | 422 | `INVALID_STATE_TOKEN` |
+| 提交时相关当前版本或锁集合已变化 | 409 | `STALE_REVISION_PREVIEW` |
+
+预演响应示例（部分重叠：v2 将替换 4–6 月，v3/v4 为左右补偿片段）：
+
+```json
+{
+  "contract_no": "HT-2026-001",
+  "ready": true,
+  "state_token": "eyJ2IjoxLCJjb250...<省略>...1a2b3c",
+  "created": {"contract_no": "HT-2026-001", "rate": 0.09, "version": 2,
+              "valid_from": "2026-04-01T00:00:00.000000+00:00",
+              "valid_to": "2026-07-01T00:00:00.000000+00:00",
+              "recorded_at": "2026-03-01T00:00:00.000000+00:00",
+              "reason": "年中调整"},
+  "superseded_versions": [
+    {"rate_id": 1, "rate": 0.05, "version": 1, "status": "current", "...": "..."}
+  ],
+  "retained_versions": [
+    {"contract_no": "HT-2026-001", "rate": 0.05, "version": 3,
+     "valid_from": "2026-01-01T00:00:00.000000+00:00",
+     "valid_to": "2026-04-01T00:00:00.000000+00:00",
+     "recorded_at": "2026-03-01T00:00:00.000000+00:00", "reason": "原费率"},
+    {"contract_no": "HT-2026-001", "rate": 0.05, "version": 4,
+     "valid_from": "2026-07-01T00:00:00.000000+00:00",
+     "valid_to": "2027-01-01T00:00:00.000000+00:00",
+     "recorded_at": "2026-03-01T00:00:00.000000+00:00", "reason": "原费率"}
+  ],
+  "blocking": null
+}
+```
+
+被阻断的预演响应示例（拟议区间与结算期锁相交）：
+
+```json
+{
+  "contract_no": "HT-2026-001",
+  "ready": false,
+  "state_token": null,
+  "created": null,
+  "superseded_versions": [],
+  "retained_versions": [],
+  "blocking": {
+    "code": "RATE_WINDOW_LOCKED",
+    "message": "合同 'HT-2026-001' 的拟议区间 [...] 与 1 个结算期费率锁片段相交，锁定窗口内不得修订费率",
+    "locks": [{"lock_id": 2, "basis_rate_id": 2, "...": "..."}],
+    "intersections": [{"from": "2026-05-01T00:00:00.000000+00:00",
+                       "to": "2026-06-01T00:00:00.000000+00:00"}]
+  }
+}
+```
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -471,7 +585,7 @@ pytest                 # 运行测试
 ```
 app/
   main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG、结算期费率锁）
+  logic.py     双时态核心逻辑（追加式录入、修订预演与条件提交、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG、结算期费率锁）
   db.py        SQLite 连接与自动建表（rate_versions + rate_version_edges 血缘边 + rate_locks 费率锁）
   timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py

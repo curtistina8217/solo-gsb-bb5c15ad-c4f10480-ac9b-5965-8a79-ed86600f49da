@@ -10,9 +10,19 @@
 版本血缘（rate_version_edges）随修订在同一事务写入：新费率对每个被取代版本建立
 supersedes 边，补偿片段对其来源旧版本建立 retained_from 边；边方向为
 后继版本 -> 祖先版本，没有出边的版本视为血缘根。
+
+修订预演（preview_rate_revision）与正式录入（record_rate）共用同一规划逻辑
+（_plan_rate_revision：锁相交优先 → recorded_at 单调性 → 部分重叠补偿 → 版本号
+递增）；预演全程只读并签发 state_token，携带 token 的提交仅当合同当前版本集合
+与锁集合自预演以来未变化时才落库，否则整体拒绝、不写任何数据。
 """
 
+import base64
+import hashlib
+import hmac
+import json
 import math
+import os
 import sqlite3
 from collections import deque
 from datetime import datetime
@@ -75,6 +85,164 @@ class RateWindowLockedError(ValueError):
         self.conflicts = conflicts
 
 
+class InvalidStateTokenError(ValueError):
+    """state_token 非法：格式/签名错误、缺少必要字段，或与本次录入参数不一致。"""
+
+
+class StaleRevisionPreviewError(ValueError):
+    """携带 state_token 提交时，相关当前版本或锁集合在预演后已变化，预演失效。"""
+
+
+def _normalize_revision(
+    valid_from: datetime,
+    valid_to: Optional[datetime],
+    recorded_at: Optional[datetime],
+) -> tuple[str, Optional[str], str]:
+    """规范化录入/预演的时间参数为等宽 ISO 字符串；区间非法抛 InvalidIntervalError。"""
+    vf = iso(valid_from)
+    vt = iso(valid_to) if valid_to is not None else None
+    ra = iso(recorded_at) if recorded_at is not None else now_iso()
+    if vt is not None and vt <= vf:
+        raise InvalidIntervalError("valid_to 必须晚于 valid_from")
+    return vf, vt, ra
+
+
+def _plan_rate_revision(
+    conn: sqlite3.Connection,
+    contract_no: str,
+    vf: str,
+    vt: Optional[str],
+    ra: str,
+) -> dict:
+    """计算费率修订计划（只读，不写库）；预演与正式录入共用，保证结果一致。
+
+    校验顺序：结算期锁相交优先，其次 recorded_at 单调性；任一不满足即抛错。
+    返回 {"next_version", "overlaps", "pieces"}：overlaps 为将被取代的当前版本行
+    （按 valid_from、id 排序）；pieces 为补偿片段 (片段起点, 片段终点, 源顺序, 源版本行)
+    列表，按 (片段起点, 源顺序) 排序。
+    """
+    # 结算期锁优先：拟议区间与任一锁定片段相交（左闭右开，仅相接不算）时
+    # 直接拒绝，此时尚未写入任何新版本、补偿片段或血缘边。
+    conflicts = _find_lock_conflicts(conn, contract_no, vf, vt)
+    if conflicts:
+        raise RateWindowLockedError(
+            f"合同 '{contract_no}' 的拟议区间 [{vf}, {vt or '∞'}) 与 "
+            f"{len(conflicts)} 个结算期费率锁片段相交，锁定窗口内不得修订费率",
+            conflicts,
+        )
+
+    state = conn.execute(
+        "SELECT MAX(recorded_at) AS max_ra, COALESCE(MAX(version), 0) AS max_v "
+        "FROM rate_versions WHERE contract_no = ?",
+        (contract_no,),
+    ).fetchone()
+    if state["max_ra"] is not None and ra < state["max_ra"]:
+        raise NonMonotonicRecordTimeError(
+            f"recorded_at={ra} 早于合同 {contract_no} 已有记录时间 {state['max_ra']}，"
+            "系统时间必须单调递增"
+        )
+
+    overlaps = conn.execute(
+        "SELECT * FROM rate_versions "
+        "WHERE contract_no = ? AND superseded_at IS NULL "
+        "  AND valid_from < COALESCE(?, ?) "
+        "  AND COALESCE(valid_to, ?) > ? "
+        "ORDER BY valid_from ASC, id ASC",
+        (contract_no, vt, INF, INF, vf),
+    ).fetchall()
+
+    # 逐条计算交集之外的补偿片段：(valid_from, valid_to, 源顺序, 旧版本行)。
+    # 左段严格以 vf 为终点、右段严格以 vt 为起点，故片段必非空；
+    # 新区间开放上界（vt IS NULL）时不存在右段。
+    pieces: list[tuple[str, Optional[str], int, sqlite3.Row]] = []
+    for order, old in enumerate(overlaps):
+        if old["valid_from"] < vf:
+            pieces.append((old["valid_from"], vf, order, old))
+        if vt is not None and (old["valid_to"] is None or vt < old["valid_to"]):
+            pieces.append((vt, old["valid_to"], order, old))
+    pieces.sort(key=lambda p: (p[0], p[2]))
+
+    return {
+        "next_version": state["max_v"] + 1,
+        "overlaps": list(overlaps),
+        "pieces": pieces,
+    }
+
+
+def _apply_rate_revision(
+    conn: sqlite3.Connection,
+    contract_no: str,
+    rate: float,
+    vf: str,
+    vt: Optional[str],
+    ra: str,
+    reason: Optional[str],
+    plan: dict,
+) -> tuple[sqlite3.Row, list[int], list[sqlite3.Row]]:
+    """执行已规划的修订：新版本、补偿片段、取代标记与血缘边。
+
+    调用方保证这些写入处于同一事务；返回 (新版本行, 被取代的版本 id 列表, 补偿版本行列表)。
+    """
+    # 先创建新费率，version 严格递增；补偿片段按 valid_from 顺序紧随其后。
+    next_version = plan["next_version"]
+    cursor = conn.execute(
+        "INSERT INTO rate_versions "
+        "(contract_no, rate, valid_from, valid_to, recorded_at, version, reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (contract_no, rate, vf, vt, ra, next_version, reason),
+    )
+    new_row = conn.execute(
+        "SELECT * FROM rate_versions WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+
+    retained_rows: list[sqlite3.Row] = []
+    for piece_vf, piece_vt, _, old in plan["pieces"]:
+        piece_cursor = conn.execute(
+            "INSERT INTO rate_versions "
+            "(contract_no, rate, valid_from, valid_to, recorded_at, version, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                contract_no,
+                old["rate"],
+                piece_vf,
+                piece_vt,
+                ra,
+                next_version + 1 + len(retained_rows),
+                old["reason"],
+            ),
+        )
+        retained_id = piece_cursor.lastrowid
+        retained_rows.append(
+            conn.execute(
+                "SELECT * FROM rate_versions WHERE id = ?",
+                (retained_id,),
+            ).fetchone()
+        )
+        # 补偿片段 -> 切出它的来源旧版本（retained_from）
+        conn.execute(
+            "INSERT INTO rate_version_edges "
+            "(from_rate_id, to_rate_id, relation, recorded_at) "
+            "VALUES (?, ?, 'retained_from', ?)",
+            (retained_id, old["id"], ra),
+        )
+
+    # 取代标记与新增行在同一事务提交，任一失败整体回滚。
+    superseded_ids = [row["id"] for row in plan["overlaps"]]
+    for version_id in superseded_ids:
+        conn.execute(
+            "UPDATE rate_versions SET superseded_at = ? WHERE id = ?",
+            (ra, version_id),
+        )
+        # 新费率 -> 本次被取代的每个旧版本（supersedes）
+        conn.execute(
+            "INSERT INTO rate_version_edges "
+            "(from_rate_id, to_rate_id, relation, recorded_at) "
+            "VALUES (?, ?, 'supersedes', ?)",
+            (new_row["id"], version_id, ra),
+        )
+    return new_row, superseded_ids, retained_rows
+
+
 def record_rate(
     contract_no: str,
     rate: float,
@@ -83,6 +251,7 @@ def record_rate(
     recorded_at: Optional[datetime],
     reason: Optional[str],
     conn: Optional[sqlite3.Connection] = None,
+    state_token: Optional[str] = None,
 ) -> tuple[sqlite3.Row, list[int], list[sqlite3.Row]]:
     """录入费率（追加式）。
 
@@ -97,121 +266,56 @@ def record_rate(
     同一事务写入：新版本对每个被取代版本建 supersedes 边，每个补偿片段对其
     来源旧版本建 retained_from 边。
 
+    携带 state_token（修订预演签发）时为条件提交：先校验 token 签名与绑定参数
+    （contract_no / rate / 区间 / reason；recorded_at 缺省时以 token 绑定的预演
+    时间为准），再比对合同状态指纹——当前版本集合、版本号/记录时间水位与锁集合
+    自预演以来有任何变化即抛 StaleRevisionPreviewError，不产生任何写入；
+    指纹一致时才按同一规划逻辑提交，结果与预演完全一致。
+
     返回 (新版本行, 被取代的版本 id 列表, 补偿版本行列表)。
     """
-    vf = iso(valid_from)
-    vt = iso(valid_to) if valid_to is not None else None
-    ra = iso(recorded_at) if recorded_at is not None else now_iso()
+    vf, vt, ra = _normalize_revision(valid_from, valid_to, recorded_at)
 
-    if vt is not None and vt <= vf:
-        raise InvalidIntervalError("valid_to 必须晚于 valid_from")
+    token_payload = None
+    if state_token is not None:
+        token_payload = _decode_state_token(state_token)
+        bound = {
+            "contract_no": contract_no,
+            "rate": rate,
+            "valid_from": vf,
+            "valid_to": vt,
+            "reason": reason,
+        }
+        for key, value in bound.items():
+            if token_payload[key] != value:
+                raise InvalidStateTokenError(
+                    f"state_token 绑定的 {key}={token_payload[key]!r} "
+                    f"与本次录入参数 {value!r} 不一致"
+                )
+        if recorded_at is not None and token_payload["recorded_at"] != ra:
+            raise InvalidStateTokenError(
+                f"state_token 绑定的 recorded_at={token_payload['recorded_at']!r} "
+                f"与本次录入参数 {ra!r} 不一致"
+            )
+        # recorded_at 缺省时以 token 绑定的预演时间为准，保证提交与预演完全一致
+        ra = token_payload["recorded_at"]
 
     own_conn = conn is None
     if own_conn:
         conn = connect()
     try:
-        # 结算期锁优先：拟议区间与任一锁定片段相交（左闭右开，仅相接不算）时
-        # 直接拒绝，此时尚未写入任何新版本、补偿片段或血缘边。
-        conflicts = _find_lock_conflicts(conn, contract_no, vf, vt)
-        if conflicts:
-            raise RateWindowLockedError(
-                f"合同 '{contract_no}' 的拟议区间 [{vf}, {vt or '∞'}) 与 "
-                f"{len(conflicts)} 个结算期费率锁片段相交，锁定窗口内不得修订费率",
-                conflicts,
-            )
-
-        state = conn.execute(
-            "SELECT MAX(recorded_at) AS max_ra, COALESCE(MAX(version), 0) AS max_v "
-            "FROM rate_versions WHERE contract_no = ?",
-            (contract_no,),
-        ).fetchone()
-        if state["max_ra"] is not None and ra < state["max_ra"]:
-            raise NonMonotonicRecordTimeError(
-                f"recorded_at={ra} 早于合同 {contract_no} 已有记录时间 {state['max_ra']}，"
-                "系统时间必须单调递增"
-            )
-
-        overlaps = conn.execute(
-            "SELECT * FROM rate_versions "
-            "WHERE contract_no = ? AND superseded_at IS NULL "
-            "  AND valid_from < COALESCE(?, ?) "
-            "  AND COALESCE(valid_to, ?) > ? "
-            "ORDER BY valid_from ASC, id ASC",
-            (contract_no, vt, INF, INF, vf),
-        ).fetchall()
-
-        # 逐条计算交集之外的补偿片段：(valid_from, valid_to, 源顺序, 旧版本行)。
-        # 左段严格以 vf 为终点、右段严格以 vt 为起点，故片段必非空；
-        # 新区间开放上界（vt IS NULL）时不存在右段。
-        pieces: list[tuple[str, Optional[str], int, sqlite3.Row]] = []
-        for order, old in enumerate(overlaps):
-            if old["valid_from"] < vf:
-                pieces.append((old["valid_from"], vf, order, old))
-            if vt is not None and (old["valid_to"] is None or vt < old["valid_to"]):
-                pieces.append((vt, old["valid_to"], order, old))
-        pieces.sort(key=lambda p: (p[0], p[2]))
-
-        # 先创建新费率，version 严格递增；补偿片段按 valid_from 顺序紧随其后。
-        next_version = state["max_v"] + 1
-        cursor = conn.execute(
-            "INSERT INTO rate_versions "
-            "(contract_no, rate, valid_from, valid_to, recorded_at, version, reason) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (contract_no, rate, vf, vt, ra, next_version, reason),
-        )
-        new_row = conn.execute(
-            "SELECT * FROM rate_versions WHERE id = ?", (cursor.lastrowid,)
-        ).fetchone()
-
-        retained_rows: list[sqlite3.Row] = []
-        for piece_vf, piece_vt, _, old in pieces:
-            piece_cursor = conn.execute(
-                "INSERT INTO rate_versions "
-                "(contract_no, rate, valid_from, valid_to, recorded_at, version, reason) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    contract_no,
-                    old["rate"],
-                    piece_vf,
-                    piece_vt,
-                    ra,
-                    next_version + 1 + len(retained_rows),
-                    old["reason"],
-                ),
-            )
-            retained_id = piece_cursor.lastrowid
-            retained_rows.append(
-                conn.execute(
-                    "SELECT * FROM rate_versions WHERE id = ?",
-                    (retained_id,),
-                ).fetchone()
-            )
-            # 补偿片段 -> 切出它的来源旧版本（retained_from）
-            conn.execute(
-                "INSERT INTO rate_version_edges "
-                "(from_rate_id, to_rate_id, relation, recorded_at) "
-                "VALUES (?, ?, 'retained_from', ?)",
-                (retained_id, old["id"], ra),
-            )
-
-        # 取代标记与新增行在同一事务提交，任一失败整体回滚。
-        superseded_ids = [row["id"] for row in overlaps]
-        for version_id in superseded_ids:
-            conn.execute(
-                "UPDATE rate_versions SET superseded_at = ? WHERE id = ?",
-                (ra, version_id),
-            )
-            # 新费率 -> 本次被取代的每个旧版本（supersedes）
-            conn.execute(
-                "INSERT INTO rate_version_edges "
-                "(from_rate_id, to_rate_id, relation, recorded_at) "
-                "VALUES (?, ?, 'supersedes', ?)",
-                (new_row["id"], version_id, ra),
-            )
-
+        if token_payload is not None:
+            current_fingerprint = _contract_state_fingerprint(conn, contract_no)
+            if current_fingerprint != token_payload["fingerprint"]:
+                raise StaleRevisionPreviewError(
+                    f"合同 '{contract_no}' 的当前版本集合或锁集合在预演后已变化，"
+                    "state_token 已失效，请重新预演后再提交"
+                )
+        plan = _plan_rate_revision(conn, contract_no, vf, vt, ra)
+        result = _apply_rate_revision(conn, contract_no, rate, vf, vt, ra, reason, plan)
         if own_conn:
             conn.commit()
-        return new_row, superseded_ids, retained_rows
+        return result
     except Exception:
         if own_conn:
             conn.rollback()
@@ -219,6 +323,143 @@ def record_rate(
     finally:
         if own_conn:
             conn.close()
+
+
+# ---------- 修订预演与条件提交 ----------
+
+def _contract_state_fingerprint(conn: sqlite3.Connection, contract_no: str) -> str:
+    """合同级规划状态指纹：当前版本集合、版本号/记录时间水位与锁集合的哈希。
+
+    预演签发 state_token 时计算一次，携带 token 提交时重算比对；任何会影响
+    规划结果的状态变化（新版本、取代标记、新锁）都会改变指纹。
+    """
+    state = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) AS max_v, MAX(recorded_at) AS max_ra "
+        "FROM rate_versions WHERE contract_no = ?",
+        (contract_no,),
+    ).fetchone()
+    currents = conn.execute(
+        "SELECT id, version, rate, valid_from, valid_to, recorded_at, reason "
+        "FROM rate_versions WHERE contract_no = ? AND superseded_at IS NULL "
+        "ORDER BY id ASC",
+        (contract_no,),
+    ).fetchall()
+    locks = conn.execute(
+        "SELECT id, valid_from, valid_to, known_at, basis_rate_id, reason "
+        "FROM rate_locks WHERE contract_no = ? ORDER BY id ASC",
+        (contract_no,),
+    ).fetchall()
+    h = hashlib.sha256()
+    h.update(repr(("state", state["max_v"], state["max_ra"])).encode("utf-8"))
+    for row in currents:
+        h.update(repr(("version", *tuple(row))).encode("utf-8"))
+    for row in locks:
+        h.update(repr(("lock", *tuple(row))).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _token_secret() -> bytes:
+    """state_token 的 HMAC 密钥：环境变量 STATE_TOKEN_SECRET，缺省为开发用固定值。"""
+    return os.environ.get(
+        "STATE_TOKEN_SECRET", "rates-dev-state-token-secret"
+    ).encode("utf-8")
+
+
+def _issue_state_token(payload: dict) -> str:
+    """把预演绑定参数与状态指纹签名成无状态令牌：base64url(json).hmac_sha256。"""
+    raw = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        .encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    sig = hmac.new(_token_secret(), raw.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{raw}.{sig}"
+
+
+def _decode_state_token(token: str) -> dict:
+    """校验并解析 state_token；格式、签名或字段非法时抛 InvalidStateTokenError。"""
+    try:
+        raw, sig = token.rsplit(".", 1)
+        expected = hmac.new(
+            _token_secret(), raw.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            raise InvalidStateTokenError("state_token 签名校验失败")
+        payload = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+    except InvalidStateTokenError:
+        raise
+    except Exception:
+        raise InvalidStateTokenError("state_token 格式非法或内容无法解析") from None
+    required = {"v", "contract_no", "rate", "valid_from", "valid_to",
+                "recorded_at", "reason", "fingerprint"}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("v") != 1
+        or not required.issubset(payload)
+    ):
+        raise InvalidStateTokenError("state_token 缺少必要字段或版本不受支持")
+    return payload
+
+
+def preview_rate_revision(
+    contract_no: str,
+    rate: float,
+    valid_from: datetime,
+    valid_to: Optional[datetime],
+    recorded_at: Optional[datetime],
+    reason: Optional[str],
+) -> dict:
+    """费率修订预演：与 record_rate 共用同一规划逻辑，全程只读、不写库。
+
+    返回 {"ready", "valid_from", "valid_to", "recorded_at", ...}：
+    - ready=True：附 "plan"（_plan_rate_revision 的计划：主版本版本号、被取代
+      版本、补偿片段）与 "state_token"（绑定本次参数与合同状态指纹，供
+      POST /rates 条件提交）；
+    - ready=False：附 "blocking"（{"code", "message", "conflicts"?}），code 为
+      RATE_WINDOW_LOCKED（锁相交优先）或 NON_MONOTONIC_RECORDED_AT。
+    """
+    vf, vt, ra = _normalize_revision(valid_from, valid_to, recorded_at)
+    conn = connect()
+    try:
+        try:
+            plan = _plan_rate_revision(conn, contract_no, vf, vt, ra)
+        except RateWindowLockedError as exc:
+            return {
+                "ready": False, "valid_from": vf, "valid_to": vt, "recorded_at": ra,
+                "blocking": {
+                    "code": "RATE_WINDOW_LOCKED",
+                    "message": str(exc),
+                    "conflicts": exc.conflicts,
+                },
+            }
+        except NonMonotonicRecordTimeError as exc:
+            return {
+                "ready": False, "valid_from": vf, "valid_to": vt, "recorded_at": ra,
+                "blocking": {
+                    "code": "NON_MONOTONIC_RECORDED_AT",
+                    "message": str(exc),
+                },
+            }
+        fingerprint = _contract_state_fingerprint(conn, contract_no)
+    finally:
+        conn.close()
+    return {
+        "ready": True,
+        "valid_from": vf,
+        "valid_to": vt,
+        "recorded_at": ra,
+        "plan": plan,
+        "state_token": _issue_state_token({
+            "v": 1,
+            "contract_no": contract_no,
+            "rate": rate,
+            "valid_from": vf,
+            "valid_to": vt,
+            "recorded_at": ra,
+            "reason": reason,
+            "fingerprint": fingerprint,
+            "iat": now_iso(),
+        }),
+    }
 
 
 def find_visible_rates(
