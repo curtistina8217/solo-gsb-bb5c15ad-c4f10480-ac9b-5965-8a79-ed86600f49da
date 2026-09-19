@@ -70,6 +70,14 @@ docker compose up --build
 **不新增版本、不产生补偿片段、不写血缘边**——锁外区间的正常修订不受影响。
 锁记录不因后续修订而改变，可在审计时与当前费率对照。
 
+**费率修订预演与条件提交（v1.6 起）**：`POST /contracts/{contract_no}/rate-revision-previews`
+以与实际提交**完全相同的规划逻辑**预演一次修订（锁相交优先、时间单调性、部分重叠
+补偿、版本号规则），返回将创建的主版本、被取代版本、补偿片段与阻断原因，全程只读、
+不写库。未阻断时签发 `state_token`——绑定预演参数、相关当前版本（与拟议区间重叠的
+当前版本）、合同锁集合及版本号/记录时间水位的签名指纹；`POST /rates` 携带该 token
+即为**条件提交**：仅当上述状态自预演以来未变化时才真正写入，否则返回
+`409 STALE_REVISION_PREVIEW` 且不产生任何写入。
+
 ## 接口
 
 ### 1. 录入 / 修订费率 — `POST /rates`
@@ -99,6 +107,9 @@ curl -X POST http://localhost:8000/rates \
   （见第 8 节）：`detail.locks` 列出相交锁、`detail.intersections` 按同序列出
   各自交集 `{from, to}`；此时**不新增版本、不产生补偿片段、不写血缘边**。
   区间左闭右开，仅端点相接不算相交，锁外修订照常进行。
+- 可携带 `state_token`（费率修订预演签发，见第 10 节）进行**条件提交**：
+  仅当该合同相关当前版本与锁集合自预演以来未变化时才提交；否则返回
+  `409 STALE_REVISION_PREVIEW` 且**不产生任何写入**（v1.6 起）。
 
 部分重叠修订的响应示例（原费率 0.05 覆盖全年，新费率 0.09 只替换 4–6 月）：
 
@@ -457,6 +468,125 @@ curl http://localhost:8000/contracts/HT-2026-001/rate-locks
 多次锁定产生的片段一并返回。合同有费率版本但尚无锁时返回空数组；
 合同不存在（无任何费率版本）返回 `404 CONTRACT_NOT_FOUND`。
 
+### 10. 费率修订预演 — `POST /contracts/{contract_no}/rate-revision-previews`
+
+```bash
+curl -X POST http://localhost:8000/contracts/HT-2026-001/rate-revision-previews \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "rate": 0.09,
+        "valid_from": "2026-04-01T00:00:00Z",
+        "valid_to":   "2026-07-01T00:00:00Z",
+        "recorded_at": "2026-03-01T00:00:00Z",
+        "reason": "年中调整"
+      }'
+```
+
+- 请求体与录入接口一致（`contract_no` 取自路径）：`rate`、`valid_from` 必填，
+  `valid_to`、`recorded_at`、`reason` 可选；`recorded_at` 缺省为当前时间。
+- **与实际提交共用同一规划逻辑**：锁相交优先、时间单调性、部分重叠补偿与
+  版本号规则完全一致；开放上界、多旧版本重叠、仅端点相接等情形下，预演结果
+  与凭 token 实际提交的结果相同。
+- **全程只读、不写库**：不新增版本、不产生补偿片段、不写血缘边、不落锁。
+- 未阻断时返回 `state_token`：带入 `POST /rates` 即条件提交——仅当相关当前
+  版本与锁集合自预演以来未变化时才真正写入，否则 `409 STALE_REVISION_PREVIEW`
+  且不产生任何写入。按预演原参数提交（`recorded_at` 缺省时回传
+  `planned_version.recorded_at` 的回显值），结果与预演完全一致。
+
+响应字段：
+
+| 字段 | 含义 |
+|---|---|
+| `blocked` | 是否被阻断（锁相交或 `recorded_at` 不单调） |
+| `blocking_reasons` | 阻断原因列表（与实际提交同一判定顺序：锁相交优先）；未阻断为空 |
+| `state_token` | 未阻断时签发的状态令牌；被阻断时为 `null` |
+| `planned_version` | 预演将创建的主版本（版本号、区间、记录时间）；被阻断时为 `null` |
+| `superseded_versions` | 预演将被取代的当前版本（完整版本视图） |
+| `retained_fragments` | 预演将追加的补偿片段（原费率、原 `reason`，按 `valid_from` 排序，附 `source_rate_id`） |
+
+| 情形 | 状态码 | `code` |
+|---|---|---|
+| 预演完成（含被阻断情形，`blocked=true`） | 200 | — |
+| `valid_to <= valid_from` | 422 | `INVALID_INTERVAL` |
+| 缺少必填字段 / 时间格式非法 | 422 | `INVALID_REQUEST` |
+| 凭 token 提交时相关状态已变化 / token 非法或跨合同 | 409 | `STALE_REVISION_PREVIEW` |
+
+响应示例（部分重叠修订预演：原费率 0.05 覆盖全年，预演 4–6 月调整为 0.09）：
+
+```json
+{
+  "contract_no": "HT-2026-001",
+  "blocked": false,
+  "blocking_reasons": [],
+  "state_token": "v1.eyJjb250cmFjdF9ubyI6IkhaLTIwMjYtMDAxIiw...",
+  "planned_version": {"rate": 0.09, "version": 2,
+                      "valid_from": "2026-04-01T00:00:00.000000+00:00",
+                      "valid_to": "2026-07-01T00:00:00.000000+00:00",
+                      "recorded_at": "2026-03-01T00:00:00.000000+00:00",
+                      "reason": "年中调整"},
+  "superseded_versions": [
+    {"rate_id": 1, "rate": 0.05, "version": 1, "status": "current", "...": "..."}
+  ],
+  "retained_fragments": [
+    {"rate": 0.05, "version": 3,
+     "valid_from": "2026-01-01T00:00:00.000000+00:00",
+     "valid_to": "2026-04-01T00:00:00.000000+00:00",
+     "reason": "原费率", "source_rate_id": 1},
+    {"rate": 0.05, "version": 4,
+     "valid_from": "2026-07-01T00:00:00.000000+00:00",
+     "valid_to": "2027-01-01T00:00:00.000000+00:00",
+     "reason": "原费率", "source_rate_id": 1}
+  ]
+}
+```
+
+被阻断的预演（拟议区间与结算期锁相交）：
+
+```json
+{
+  "contract_no": "HT-2026-001",
+  "blocked": true,
+  "blocking_reasons": [
+    {"code": "RATE_WINDOW_LOCKED",
+     "message": "合同 'HT-2026-001' 的拟议区间 [...] 与 1 个结算期费率锁片段相交，锁定窗口内不得修订费率",
+     "locks": [{"lock_id": 2, "basis_rate_id": 2, "...": "..."}],
+     "intersections": [{"from": "2026-05-01T00:00:00.000000+00:00",
+                        "to": "2026-06-01T00:00:00.000000+00:00"}]}
+  ],
+  "state_token": null,
+  "planned_version": null,
+  "superseded_versions": [],
+  "retained_fragments": []
+}
+```
+
+凭 token 条件提交（状态未变化时与预演结果完全一致）：
+
+```bash
+curl -X POST http://localhost:8000/rates \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "contract_no": "HT-2026-001",
+        "rate": 0.09,
+        "valid_from": "2026-04-01T00:00:00Z",
+        "valid_to":   "2026-07-01T00:00:00Z",
+        "recorded_at": "2026-03-01T00:00:00Z",
+        "reason": "年中调整",
+        "state_token": "v1.eyJjb250cmFjdF9ubyI6IkhaLTIwMjYtMDAxIiw..."
+      }'
+```
+
+若预演之后该合同发生了新的修订或新增费率锁，同一 token 提交将被拒绝：
+
+```json
+{
+  "detail": {
+    "code": "STALE_REVISION_PREVIEW",
+    "message": "state_token 已失效或不适用于本合同：合同 'HT-2026-001' 的相关当前版本或锁集合在预演后已变化，未产生任何写入，请重新预演后再提交"
+  }
+}
+```
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -471,7 +601,7 @@ pytest                 # 运行测试
 ```
 app/
   main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG、结算期费率锁）
+  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG、结算期费率锁、费率修订预演与条件提交）
   db.py        SQLite 连接与自动建表（rate_versions + rate_version_edges 血缘边 + rate_locks 费率锁）
   timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py

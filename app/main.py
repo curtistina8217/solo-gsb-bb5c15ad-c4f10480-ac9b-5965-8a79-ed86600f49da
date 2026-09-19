@@ -24,8 +24,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="合同费率双时态追溯 API",
-    version="1.5.0",
-    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史；版本血缘以可审计的 supersedes / retained_from 边记录；结算期费率锁保证锁定窗口内费率不再被修订。",
+    version="1.6.0",
+    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史；版本血缘以可审计的 supersedes / retained_from 边记录；结算期费率锁保证锁定窗口内费率不再被修订；费率修订预演签发 state_token，POST /rates 可凭令牌条件提交（状态已变化则 409 STALE_REVISION_PREVIEW）。",
     lifespan=lifespan,
 )
 
@@ -39,6 +39,10 @@ class RateCreate(BaseModel):
     valid_to: Optional[datetime] = Field(default=None, description="业务生效终点（不含），缺省为无限期")
     recorded_at: Optional[datetime] = Field(default=None, description="系统记录时间，缺省为当前时间；同一合同内必须单调递增")
     reason: Optional[str] = Field(default=None, max_length=500, description="录入/修订说明")
+    state_token: Optional[str] = Field(
+        default=None, max_length=16384,
+        description="费率修订预演签发的状态令牌；携带时仅当相关当前版本与锁集合自预演以来未变化才提交，否则 409 STALE_REVISION_PREVIEW",
+    )
 
 
 class VersionView(BaseModel):
@@ -237,6 +241,72 @@ class RateLockListResponse(BaseModel):
     locks: list[RateLockView]
 
 
+class RateRevisionPreviewCreate(BaseModel):
+    """费率修订预演请求：费率区间与 recorded_at 等同录入接口，合同号取自路径。"""
+
+    rate: float = Field(description="费率值")
+    valid_from: datetime = Field(description="业务生效起点（含），ISO-8601")
+    valid_to: Optional[datetime] = Field(default=None, description="业务生效终点（不含），缺省为无限期")
+    recorded_at: Optional[datetime] = Field(default=None, description="系统记录时间，缺省为当前时间；同一合同内必须单调递增")
+    reason: Optional[str] = Field(default=None, max_length=500, description="录入/修订说明")
+
+
+class PlannedVersionView(BaseModel):
+    """预演将创建的主版本（尚未落库，无 rate_id）。"""
+
+    rate: float
+    version: int = Field(description="预演将创建的版本号（与实际提交一致）")
+    valid_from: str
+    valid_to: Optional[str]
+    recorded_at: str = Field(description="实际使用的记录时间（缺省时为预演时刻，并绑定进 state_token）")
+    reason: Optional[str]
+
+
+class RetainedFragmentView(BaseModel):
+    """预演将追加的补偿片段（尚未落库，无 rate_id）。"""
+
+    rate: float
+    version: int = Field(description="预演将创建的补偿版本号（紧随主版本，严格递增）")
+    valid_from: str
+    valid_to: Optional[str]
+    reason: Optional[str]
+    source_rate_id: int = Field(description="切出该补偿片段的来源旧版本 id")
+
+
+class IntervalView(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from", description="交集起点（含）")
+    to: str = Field(description="交集终点（不含）")
+
+
+class BlockingReasonView(BaseModel):
+    code: str = Field(description="RATE_WINDOW_LOCKED / NON_MONOTONIC_RECORDED_AT")
+    message: str
+    locks: list[RateLockView] = Field(default_factory=list, description="RATE_WINDOW_LOCKED 时相交的锁")
+    intersections: list[IntervalView] = Field(default_factory=list, description="RATE_WINDOW_LOCKED 时各锁与拟议区间的交集")
+
+
+class RateRevisionPreviewResponse(BaseModel):
+    contract_no: str
+    blocked: bool = Field(description="是否被阻断（锁相交或 recorded_at 不单调）")
+    blocking_reasons: list[BlockingReasonView] = Field(
+        description="阻断原因（与实际提交同一判定顺序：锁相交优先）；未阻断为空列表"
+    )
+    state_token: Optional[str] = Field(
+        description="未阻断时签发的状态令牌，供 POST /rates 条件提交；被阻断时为 null"
+    )
+    planned_version: Optional[PlannedVersionView] = Field(
+        description="预演将创建的主版本；被阻断时为 null"
+    )
+    superseded_versions: list[VersionView] = Field(
+        description="预演将被取代的当前版本（完整版本视图）；被阻断时为空列表"
+    )
+    retained_fragments: list[RetainedFragmentView] = Field(
+        description="预演将追加的补偿片段（原费率、原 reason，按 valid_from 排序）；被阻断时为空列表"
+    )
+
+
 def to_view(row: sqlite3.Row) -> VersionView:
     return VersionView(
         rate_id=row["id"],
@@ -295,7 +365,9 @@ def health():
 @app.post("/rates", response_model=RateCreated, status_code=status.HTTP_201_CREATED)
 def create_rate(payload: RateCreate):
     """录入费率。与既有当前版本区间重叠时自动修订：旧版本仅交集被替换，
-    交集之外的左、右部分按原费率与 reason 追加为补偿版本，历史保留、窗口外报价不变。"""
+    交集之外的左、右部分按原费率与 reason 追加为补偿版本，历史保留、窗口外报价不变。
+    携带 state_token（费率修订预演签发）时为条件提交：仅当相关当前版本与锁集合
+    自预演以来未变化才写入，否则 409 STALE_REVISION_PREVIEW 且不产生任何写入。"""
     try:
         row, superseded_ids, retained_rows = logic.record_rate(
             contract_no=payload.contract_no,
@@ -304,6 +376,7 @@ def create_rate(payload: RateCreate):
             valid_to=payload.valid_to,
             recorded_at=payload.recorded_at,
             reason=payload.reason,
+            state_token=payload.state_token,
         )
     except logic.InvalidIntervalError as exc:
         raise HTTPException(
@@ -324,6 +397,11 @@ def create_rate(payload: RateCreate):
                 "locks": [to_lock_view(c["lock"]).model_dump(by_alias=True) for c in exc.conflicts],
                 "intersections": [c["intersection"] for c in exc.conflicts],
             },
+        )
+    except logic.StaleRevisionPreviewError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "STALE_REVISION_PREVIEW", "message": str(exc)},
         )
     return RateCreated(
         created=to_view(row),
@@ -573,4 +651,67 @@ def list_rate_locks(contract_no: str):
     return RateLockListResponse(
         contract_no=contract_no,
         locks=[to_lock_view(r) for r in logic.get_rate_locks(contract_no)],
+    )
+
+
+@app.post("/contracts/{contract_no}/rate-revision-previews", response_model=RateRevisionPreviewResponse)
+def rate_revision_preview(contract_no: str, payload: RateRevisionPreviewCreate):
+    """费率修订预演：按与实际提交完全相同的规划逻辑（锁相交优先、时间单调性、
+    部分重叠补偿、版本号规则）返回将创建的主版本、被取代版本、补偿片段与阻断原因，
+    全程只读、不写库。未阻断时签发 state_token，供 POST /rates 条件提交。"""
+    try:
+        result = logic.preview_rate_revision(
+            contract_no=contract_no,
+            rate=payload.rate,
+            valid_from=payload.valid_from,
+            valid_to=payload.valid_to,
+            recorded_at=payload.recorded_at,
+            reason=payload.reason,
+        )
+    except logic.InvalidIntervalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_INTERVAL", "message": str(exc)},
+        )
+    plan = result["plan"]
+    planned_version = None
+    superseded: list[VersionView] = []
+    fragments: list[RetainedFragmentView] = []
+    if not result["blocked"]:
+        planned_version = PlannedVersionView(
+            rate=payload.rate,
+            version=plan["next_version"],
+            valid_from=result["vf"],
+            valid_to=result["vt"],
+            recorded_at=result["ra"],
+            reason=payload.reason,
+        )
+        superseded = [to_view(row) for row in plan["overlaps"]]
+        fragments = [
+            RetainedFragmentView(
+                rate=old["rate"],
+                version=plan["next_version"] + 1 + index,
+                valid_from=piece_vf,
+                valid_to=piece_vt,
+                reason=old["reason"],
+                source_rate_id=old["id"],
+            )
+            for index, (piece_vf, piece_vt, _, old) in enumerate(plan["pieces"])
+        ]
+    return RateRevisionPreviewResponse(
+        contract_no=contract_no,
+        blocked=result["blocked"],
+        blocking_reasons=[
+            BlockingReasonView(
+                code=blocking["code"],
+                message=blocking["message"],
+                locks=[to_lock_view(c["lock"]) for c in blocking["conflicts"]],
+                intersections=[IntervalView(**c["intersection"]) for c in blocking["conflicts"]],
+            )
+            for blocking in result["blocking_reasons"]
+        ],
+        state_token=result["state_token"],
+        planned_version=planned_version,
+        superseded_versions=superseded,
+        retained_fragments=fragments,
     )

@@ -10,8 +10,17 @@
 版本血缘（rate_version_edges）随修订在同一事务写入：新费率对每个被取代版本建立
 supersedes 边，补偿片段对其来源旧版本建立 retained_from 边；边方向为
 后继版本 -> 祖先版本，没有出边的版本视为血缘根。
+
+费率修订预演（preview_rate_revision）与实际提交共用同一规划逻辑（_plan_revision），
+全程只读、不写库；预演签发的 state_token 绑定预演参数、相关当前版本与锁集合的
+签名指纹，record_rate 携带该令牌时仅当上述状态未变化才提交，否则拒绝且不产生
+任何写入。
 """
 
+import base64
+import hashlib
+import hmac
+import json
 import math
 import sqlite3
 from collections import deque
@@ -75,6 +84,86 @@ class RateWindowLockedError(ValueError):
         self.conflicts = conflicts
 
 
+class StaleRevisionPreviewError(ValueError):
+    """state_token 已失效或不适用于本合同：相关当前版本或锁集合在预演后
+    已变化（或令牌非法），条件提交被拒绝，不产生任何写入。"""
+
+
+def _lock_conflict_message(
+    contract_no: str, vf: str, vt: Optional[str], conflicts: list[dict]
+) -> str:
+    """锁相交拒绝文案（预演阻断原因与实际提交的 409 响应共用）。"""
+    return (
+        f"合同 '{contract_no}' 的拟议区间 [{vf}, {vt or '∞'}) 与 "
+        f"{len(conflicts)} 个结算期费率锁片段相交，锁定窗口内不得修订费率"
+    )
+
+
+def _non_monotonic_message(contract_no: str, ra: str, max_ra: str) -> str:
+    """recorded_at 单调性拒绝文案（预演阻断原因与实际提交的 422 响应共用）。"""
+    return (
+        f"recorded_at={ra} 早于合同 {contract_no} 已有记录时间 {max_ra}，"
+        "系统时间必须单调递增"
+    )
+
+
+def _plan_revision(
+    conn: sqlite3.Connection,
+    contract_no: str,
+    vf: str,
+    vt: Optional[str],
+    ra: str,
+) -> dict:
+    """修订规划（只读）：费率修订预演与实际提交共用，保证两者结果一致。
+
+    vf / vt / ra 均须为已规范化的等宽 ISO 字符串（vt 为 None 表示开放上界）。
+    判定顺序与实际提交一致：锁相交优先，其次 recorded_at 单调性。返回 {
+        "lock_conflicts": 与拟议区间相交的锁片段（空列表表示无冲突），
+        "max_recorded_at": 合同当前最大记录时间（无记录时为 None），
+        "non_monotonic": ra 是否破坏系统时间单调性，
+        "overlaps": 与拟议区间重叠的当前版本行（按 valid_from, id 排序），
+        "pieces": 补偿片段 (valid_from, valid_to, 源顺序, 旧版本行)，按 valid_from 排序，
+        "next_version": 本次将创建的版本号，
+    }。
+    """
+    lock_conflicts = _find_lock_conflicts(conn, contract_no, vf, vt)
+
+    state = conn.execute(
+        "SELECT MAX(recorded_at) AS max_ra, COALESCE(MAX(version), 0) AS max_v "
+        "FROM rate_versions WHERE contract_no = ?",
+        (contract_no,),
+    ).fetchone()
+
+    overlaps = conn.execute(
+        "SELECT * FROM rate_versions "
+        "WHERE contract_no = ? AND superseded_at IS NULL "
+        "  AND valid_from < COALESCE(?, ?) "
+        "  AND COALESCE(valid_to, ?) > ? "
+        "ORDER BY valid_from ASC, id ASC",
+        (contract_no, vt, INF, INF, vf),
+    ).fetchall()
+
+    # 逐条计算交集之外的补偿片段：(valid_from, valid_to, 源顺序, 旧版本行)。
+    # 左段严格以 vf 为终点、右段严格以 vt 为起点，故片段必非空；
+    # 新区间开放上界（vt IS NULL）时不存在右段。
+    pieces: list[tuple[str, Optional[str], int, sqlite3.Row]] = []
+    for order, old in enumerate(overlaps):
+        if old["valid_from"] < vf:
+            pieces.append((old["valid_from"], vf, order, old))
+        if vt is not None and (old["valid_to"] is None or vt < old["valid_to"]):
+            pieces.append((vt, old["valid_to"], order, old))
+    pieces.sort(key=lambda p: (p[0], p[2]))
+
+    return {
+        "lock_conflicts": lock_conflicts,
+        "max_recorded_at": state["max_ra"],
+        "non_monotonic": state["max_ra"] is not None and ra < state["max_ra"],
+        "overlaps": overlaps,
+        "pieces": pieces,
+        "next_version": state["max_v"] + 1,
+    }
+
+
 def record_rate(
     contract_no: str,
     rate: float,
@@ -82,6 +171,7 @@ def record_rate(
     valid_to: Optional[datetime],
     recorded_at: Optional[datetime],
     reason: Optional[str],
+    state_token: Optional[str] = None,
     conn: Optional[sqlite3.Connection] = None,
 ) -> tuple[sqlite3.Row, list[int], list[sqlite3.Row]]:
     """录入费率（追加式）。
@@ -97,6 +187,10 @@ def record_rate(
     同一事务写入：新版本对每个被取代版本建 supersedes 边，每个补偿片段对其
     来源旧版本建 retained_from 边。
 
+    携带 state_token（费率修订预演签发）时为条件提交：仅当该合同相关当前版本
+    与锁集合自预演以来未变化时才继续，否则抛 StaleRevisionPreviewError，
+    不产生任何写入。
+
     返回 (新版本行, 被取代的版本 id 列表, 补偿版本行列表)。
     """
     vf = iso(valid_from)
@@ -110,49 +204,35 @@ def record_rate(
     if own_conn:
         conn = connect()
     try:
+        plan = _plan_revision(conn, contract_no, vf, vt, ra)
+
+        # 预演令牌校验优先：状态自预演后已变化（或令牌非法/不适用于本合同）时
+        # 直接拒绝，此时尚未写入任何新版本、补偿片段或血缘边。
+        if state_token is not None and not _state_token_current(
+            conn, state_token, contract_no
+        ):
+            raise StaleRevisionPreviewError(
+                f"state_token 已失效或不适用于本合同：合同 '{contract_no}' 的相关"
+                "当前版本或锁集合在预演后已变化，未产生任何写入，请重新预演后再提交"
+            )
+
         # 结算期锁优先：拟议区间与任一锁定片段相交（左闭右开，仅相接不算）时
         # 直接拒绝，此时尚未写入任何新版本、补偿片段或血缘边。
-        conflicts = _find_lock_conflicts(conn, contract_no, vf, vt)
-        if conflicts:
+        if plan["lock_conflicts"]:
             raise RateWindowLockedError(
-                f"合同 '{contract_no}' 的拟议区间 [{vf}, {vt or '∞'}) 与 "
-                f"{len(conflicts)} 个结算期费率锁片段相交，锁定窗口内不得修订费率",
-                conflicts,
+                _lock_conflict_message(contract_no, vf, vt, plan["lock_conflicts"]),
+                plan["lock_conflicts"],
             )
-
-        state = conn.execute(
-            "SELECT MAX(recorded_at) AS max_ra, COALESCE(MAX(version), 0) AS max_v "
-            "FROM rate_versions WHERE contract_no = ?",
-            (contract_no,),
-        ).fetchone()
-        if state["max_ra"] is not None and ra < state["max_ra"]:
+        if plan["non_monotonic"]:
             raise NonMonotonicRecordTimeError(
-                f"recorded_at={ra} 早于合同 {contract_no} 已有记录时间 {state['max_ra']}，"
-                "系统时间必须单调递增"
+                _non_monotonic_message(contract_no, ra, plan["max_recorded_at"])
             )
 
-        overlaps = conn.execute(
-            "SELECT * FROM rate_versions "
-            "WHERE contract_no = ? AND superseded_at IS NULL "
-            "  AND valid_from < COALESCE(?, ?) "
-            "  AND COALESCE(valid_to, ?) > ? "
-            "ORDER BY valid_from ASC, id ASC",
-            (contract_no, vt, INF, INF, vf),
-        ).fetchall()
-
-        # 逐条计算交集之外的补偿片段：(valid_from, valid_to, 源顺序, 旧版本行)。
-        # 左段严格以 vf 为终点、右段严格以 vt 为起点，故片段必非空；
-        # 新区间开放上界（vt IS NULL）时不存在右段。
-        pieces: list[tuple[str, Optional[str], int, sqlite3.Row]] = []
-        for order, old in enumerate(overlaps):
-            if old["valid_from"] < vf:
-                pieces.append((old["valid_from"], vf, order, old))
-            if vt is not None and (old["valid_to"] is None or vt < old["valid_to"]):
-                pieces.append((vt, old["valid_to"], order, old))
-        pieces.sort(key=lambda p: (p[0], p[2]))
+        overlaps = plan["overlaps"]
+        pieces = plan["pieces"]
 
         # 先创建新费率，version 严格递增；补偿片段按 valid_from 顺序紧随其后。
-        next_version = state["max_v"] + 1
+        next_version = plan["next_version"]
         cursor = conn.execute(
             "INSERT INTO rate_versions "
             "(contract_no, rate, valid_from, valid_to, recorded_at, version, reason) "
@@ -219,6 +299,175 @@ def record_rate(
     finally:
         if own_conn:
             conn.close()
+
+
+# ---------- 费率修订预演与条件提交（state_token） ----------
+
+# 令牌签名密钥：仅用于乐观并发的状态指纹防伪，非访问凭证。
+_TOKEN_SECRET = b"rate-revision-preview-v1"
+
+
+def _revision_state_payload(
+    conn: sqlite3.Connection,
+    contract_no: str,
+    rate: float,
+    vf: str,
+    vt: Optional[str],
+    ra: str,
+    reason: Optional[str],
+    plan: dict,
+) -> dict:
+    """预演状态指纹：预演参数 + 相关当前版本（与拟议区间重叠者）+ 合同锁集合
+    + 版本号/记录时间水位。预演签发与提交校验共用同一构造函数，保证口径一致。"""
+    locks = conn.execute(
+        "SELECT * FROM rate_locks WHERE contract_no = ? "
+        "ORDER BY valid_from ASC, id ASC",
+        (contract_no,),
+    ).fetchall()
+    return {
+        "contract_no": contract_no,
+        "rate": rate,
+        "valid_from": vf,
+        "valid_to": vt,
+        "recorded_at": ra,
+        "reason": reason,
+        "max_version": plan["next_version"] - 1,
+        "max_recorded_at": plan["max_recorded_at"],
+        "current_versions": [
+            [row["id"], row["rate"], row["valid_from"], row["valid_to"],
+             row["recorded_at"], row["version"], row["reason"]]
+            for row in plan["overlaps"]
+        ],
+        "locks": [
+            [row["id"], row["valid_from"], row["valid_to"], row["known_at"],
+             row["basis_rate_id"], row["reason"], row["created_at"]]
+            for row in locks
+        ],
+    }
+
+
+def _make_state_token(payload: dict) -> str:
+    """把状态指纹序列化为防篡改令牌：v1.<base64url(json)>.<hmac-sha256-hex>。"""
+    body = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                   separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    sig = hmac.new(_TOKEN_SECRET, body.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"v1.{body}.{sig}"
+
+
+def _read_state_token(token: str) -> Optional[dict]:
+    """解析并校验令牌签名；格式非法或被篡改时返回 None。"""
+    try:
+        version, body, sig = token.split(".")
+        if version != "v1":
+            return None
+        expected = hmac.new(
+            _TOKEN_SECRET, body.encode("ascii"), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            return None
+        padding = "=" * (-len(body) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(body + padding))
+        if not isinstance(payload, dict):
+            return None
+        return payload
+    except (ValueError, TypeError):
+        return None
+
+
+def _state_token_current(
+    conn: sqlite3.Connection, token: str, contract_no: str
+) -> bool:
+    """令牌是否仍然有效：签名正确、适用于本合同，且按令牌内预演参数对当前
+    数据库重算的状态指纹与令牌内指纹完全一致（相关当前版本与锁集合未变化）。"""
+    payload = _read_state_token(token)
+    if payload is None or payload.get("contract_no") != contract_no:
+        return False
+    try:
+        plan = _plan_revision(
+            conn,
+            payload["contract_no"],
+            payload["valid_from"],
+            payload["valid_to"],
+            payload["recorded_at"],
+        )
+        current = _revision_state_payload(
+            conn,
+            payload["contract_no"],
+            payload["rate"],
+            payload["valid_from"],
+            payload["valid_to"],
+            payload["recorded_at"],
+            payload["reason"],
+            plan,
+        )
+    except (KeyError, TypeError):
+        return False
+    return current == payload
+
+
+def preview_rate_revision(
+    contract_no: str,
+    rate: float,
+    valid_from: datetime,
+    valid_to: Optional[datetime],
+    recorded_at: Optional[datetime],
+    reason: Optional[str],
+) -> dict:
+    """费率修订预演：与实际提交共用同一规划逻辑（_plan_revision），全程只读、不写库。
+
+    阻断判定顺序与实际提交一致：锁相交优先，其次 recorded_at 单调性。
+    未阻断时签发 state_token（绑定预演参数与状态指纹），供 POST /rates 条件提交。
+
+    返回 {"blocked", "blocking_reasons": [{"code", "message", "conflicts"}],
+          "state_token", "plan", "vf", "vt", "ra"}。
+    """
+    vf = iso(valid_from)
+    vt = iso(valid_to) if valid_to is not None else None
+    ra = iso(recorded_at) if recorded_at is not None else now_iso()
+    if vt is not None and vt <= vf:
+        raise InvalidIntervalError("valid_to 必须晚于 valid_from")
+
+    conn = connect()
+    try:
+        plan = _plan_revision(conn, contract_no, vf, vt, ra)
+        blocking_reasons: list[dict] = []
+        if plan["lock_conflicts"]:
+            blocking_reasons.append({
+                "code": "RATE_WINDOW_LOCKED",
+                "message": _lock_conflict_message(
+                    contract_no, vf, vt, plan["lock_conflicts"]
+                ),
+                "conflicts": plan["lock_conflicts"],
+            })
+        elif plan["non_monotonic"]:
+            blocking_reasons.append({
+                "code": "NON_MONOTONIC_RECORDED_AT",
+                "message": _non_monotonic_message(
+                    contract_no, ra, plan["max_recorded_at"]
+                ),
+                "conflicts": [],
+            })
+        blocked = bool(blocking_reasons)
+        state_token = None
+        if not blocked:
+            state_token = _make_state_token(
+                _revision_state_payload(
+                    conn, contract_no, rate, vf, vt, ra, reason, plan
+                )
+            )
+        return {
+            "blocked": blocked,
+            "blocking_reasons": blocking_reasons,
+            "state_token": state_token,
+            "plan": plan,
+            "vf": vf,
+            "vt": vt,
+            "ra": ra,
+        }
+    finally:
+        conn.close()
 
 
 def find_visible_rates(
